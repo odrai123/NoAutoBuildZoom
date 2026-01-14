@@ -2,7 +2,7 @@
 // Minimal: build-mode auto-zoom suppression + permanent max zoom-out increase (one-time)
 //
 // BepInEx 5.x / HarmonyX, C# 7.3
-
+// GUID must stay: lee.dsp.buildmode.noautozoom
 
 using BepInEx;
 using BepInEx.Configuration;
@@ -18,7 +18,7 @@ namespace BuildModeNoAutoZoom
     {
         public const string PluginGuid = "nekogod.dsp.buildmode.noautozoom";
         public const string PluginName = "DSP Build Mode No AutoZoom";
-        public const string PluginVersion = "1.0.0";
+        public const string PluginVersion = "1.0.1";
 
         internal static ConfigEntry<bool> Enabled;
         internal static ConfigEntry<float> ExtraMaxZoomOut;
@@ -125,12 +125,20 @@ namespace BuildModeNoAutoZoom
 
                 int idx = (int)st.IndexField.GetValue(__instance);
 
+                // Always keep the non-build snapshot up to date
                 if (!buildActive)
                 {
                     st.LastNonBuildIndex = idx;
                     st.HasNonBuild = true;
                     return;
                 }
+
+                // BUGFIX (1.0.1):
+                // Blueprint tools rely on the build/RTS camera profile for keyboard panning.
+                // If we pin the pose selector during blueprint placement/paste, panning breaks.
+                // So: do not pin while a blueprint tool is active.
+                if (IsBlueprintToolActive())
+                    return;
 
                 if (st.PinActive && idx != st.Baseline)
                     st.IndexField.SetValue(__instance, st.Baseline);
@@ -145,6 +153,23 @@ namespace BuildModeNoAutoZoom
                 var p = GameMain.mainPlayer;
                 var ab = p?.controller?.actionBuild;
                 return ab != null && ab.active;
+            }
+            catch { return false; }
+        }
+
+        private static bool IsBlueprintToolActive()
+        {
+            try
+            {
+                var p = GameMain.mainPlayer;
+                var ab = p?.controller?.actionBuild;
+                var tool = ab?.activeTool;
+                if (tool == null) return false;
+
+                // Defensive + version-tolerant:
+                // DSP blueprint tools/classes typically contain "Blueprint" in the type name.
+                string tn = tool.GetType().Name;
+                return tn.IndexOf("Blueprint", StringComparison.OrdinalIgnoreCase) >= 0;
             }
             catch { return false; }
         }
