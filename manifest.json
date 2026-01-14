@@ -1,0 +1,9 @@
+{
+  "name": "BuildModeNoAutoZoom",
+  "version_number": "1.0.0",
+  "website_url": "https://github.com/odrai123/NoAutoBuildZoom",
+  "description": "Disables the automatic camera zoom and pitch changes when entering or exiting build mode, while keeping full manual camera control. Also configurable permanent increase to maximum zoom-out.",
+  "dependencies": [
+    "xiaoye97-BepInEx-5.4.17"
+  ]
+}
