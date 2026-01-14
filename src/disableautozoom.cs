@@ -2,7 +2,7 @@
 // Minimal: build-mode auto-zoom suppression + permanent max zoom-out increase (one-time)
 //
 // BepInEx 5.x / HarmonyX, C# 7.3
-// GUID must stay: lee.dsp.buildmode.noautozoom
+
 
 using BepInEx;
 using BepInEx.Configuration;
