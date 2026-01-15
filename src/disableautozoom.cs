@@ -1,8 +1,7 @@
 ﻿// BuildModeNoAutoZoom.cs
-// Minimal: build-mode auto-zoom suppression + permanent max zoom-out increase (one-time)
 //
 // BepInEx 5.x / HarmonyX, C# 7.3
-// GUID must stay: lee.dsp.buildmode.noautozoom
+
 
 using BepInEx;
 using BepInEx.Configuration;
@@ -10,6 +9,7 @@ using HarmonyLib;
 using System;
 using System.Collections.Generic;
 using System.Reflection;
+using UnityEngine;
 
 namespace BuildModeNoAutoZoom
 {
@@ -18,33 +18,70 @@ namespace BuildModeNoAutoZoom
     {
         public const string PluginGuid = "nekogod.dsp.buildmode.noautozoom";
         public const string PluginName = "DSP Build Mode No AutoZoom";
-        public const string PluginVersion = "1.0.1";
+        public const string PluginVersion = "1.0.2";
 
         internal static ConfigEntry<bool> Enabled;
         internal static ConfigEntry<float> ExtraMaxZoomOut;
+
+        // Short enforcement window for shift-click path (frames)
+        internal static ConfigEntry<int> ShiftClickPinFrames;
 
         private void Awake()
         {
             Enabled = Config.Bind("General", "Enabled", true, "Enable mod.");
             ExtraMaxZoomOut = Config.Bind("General", "ExtraMaxZoomOut", 2f, "Permanent extra max zoom-out distance (meters). 0 disables.");
+            ShiftClickPinFrames = Config.Bind("General", "ShiftClickPinFrames", 8,
+                "How many frames to enforce the non-build camera pose after Shift+LMB (covers shift-click entry path). -Shouldn't need changing, but increase if you still see auto zooming when shift+clicking.");
 
             var h = new Harmony(PluginGuid);
-            h.PatchAll(typeof(BlenderPinPatches));
 
-            PatchPoserByName(h, "RTSPoser");
-            PatchPoserByName(h, "PRTSPoser");
+            // Patch CameraPoseBlender.Calculate (known-good hook)
+            var mCalc = AccessTools.Method(typeof(CameraPoseBlender), "Calculate");
+            if (mCalc != null)
+            {
+                var pre = new HarmonyMethod(typeof(BlenderPinPatches), nameof(BlenderPinPatches.CameraPoseBlender_Calculate_Prefix));
+                h.Patch(mCalc, prefix: pre);
+            }
+
+            // Patch RTSPoser.Calculate (if present)
+            PatchPoserByExactTypeNameFromAssemblyCSharp(h, "RTSPoser");
+            PatchPoserByExactTypeNameFromAssemblyCSharp(h, "PRTSPoser"); // harmless if absent
         }
 
-        private static void PatchPoserByName(Harmony h, string typeName)
+        private void Update()
+        {
+            if (!Enabled.Value) return;
+
+            // Detect Shift+LMB down before build mode becomes active.
+            try
+            {
+                if (!Input.GetMouseButtonDown(0)) return;
+                if (!(Input.GetKey(KeyCode.LeftShift) || Input.GetKey(KeyCode.RightShift))) return;
+
+                // Blueprint tools are handled later inside build; here tool is usually null. We still avoid interfering
+                // if blueprint is already active for some reason.
+                if (BlenderPinPatches.IsBlueprintToolActive_Public())
+                    return;
+
+                BlenderPinPatches.OnShiftClick_Public();
+            }
+            catch { }
+        }
+
+        private static void PatchPoserByExactTypeNameFromAssemblyCSharp(Harmony h, string typeName)
         {
             try
             {
-                var t = AccessTools.TypeByName(typeName);
+                var asm = FindAssembly("Assembly-CSharp");
+                if (asm == null) return;
+
+                var t = asm.GetType(typeName, false);
                 if (t == null) return;
 
                 var m = AccessTools.Method(t, "Calculate");
                 if (m == null) return;
 
+                // Require core fields
                 var fMax = AccessTools.Field(t, "distMax");
                 var fMin = AccessTools.Field(t, "distMin");
                 var fDist = AccessTools.Field(t, "dist");
@@ -58,6 +95,24 @@ namespace BuildModeNoAutoZoom
                 h.Patch(m, prefix: pre);
             }
             catch { }
+        }
+
+        private static Assembly FindAssembly(string simpleName)
+        {
+            try
+            {
+                var asms = AppDomain.CurrentDomain.GetAssemblies();
+                for (int i = 0; i < asms.Length; i++)
+                {
+                    var a = asms[i];
+                    if (a == null) continue;
+                    var n = a.GetName().Name;
+                    if (string.Equals(n, simpleName, StringComparison.OrdinalIgnoreCase))
+                        return a;
+                }
+            }
+            catch { }
+            return null;
         }
     }
 
@@ -84,9 +139,69 @@ namespace BuildModeNoAutoZoom
 
         private static bool _lastBuildActive;
 
-        [HarmonyPrefix]
-        [HarmonyPatch(typeof(CameraPoseBlender), "Calculate")]
-        private static void Prefix(CameraPoseBlender __instance)
+        // When > 0, we enforce pinning even if buildActive is still false.
+        private static int _forcedPinFrames = 0;
+
+        internal static void OnShiftClick_Public()
+        {
+            // Snapshot *right now* (still non-build), and start a short enforcement window
+            SnapshotAllBlendersAsNonBuild();
+            ArmPinningFromSnapshots();
+            _forcedPinFrames = Math.Max(1, BuildModeNoAutoZoomPlugin.ShiftClickPinFrames.Value);
+        }
+
+        internal static bool IsBlueprintToolActive_Public() => IsBlueprintToolActive();
+
+        private static void SnapshotAllBlendersAsNonBuild()
+        {
+            try
+            {
+                var blenders = Resources.FindObjectsOfTypeAll<CameraPoseBlender>();
+                if (blenders == null) return;
+
+                for (int i = 0; i < blenders.Length; i++)
+                {
+                    var b = blenders[i];
+                    if (b == null) continue;
+
+                    if (!_states.TryGetValue(b, out var st))
+                    {
+                        st = new BlenderState();
+                        st.IndexField = b.GetType().GetField("index", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                        _states[b] = st;
+                    }
+
+                    if (st.IndexField == null) continue;
+
+                    int idx = (int)st.IndexField.GetValue(b);
+                    st.LastNonBuildIndex = idx;
+                    st.HasNonBuild = true;
+                }
+            }
+            catch { }
+        }
+
+        private static void ArmPinningFromSnapshots()
+        {
+            foreach (var kv in _states)
+            {
+                var s = kv.Value;
+                if (s == null || s.IndexField == null) continue;
+
+                if (s.HasNonBuild)
+                    s.Baseline = s.LastNonBuildIndex;
+
+                s.PinActive = true;
+            }
+        }
+
+        private static void DisarmPinning()
+        {
+            foreach (var kv in _states)
+                kv.Value.PinActive = false;
+        }
+
+        public static void CameraPoseBlender_Calculate_Prefix(CameraPoseBlender __instance)
         {
             if (!BuildModeNoAutoZoomPlugin.Enabled.Value) return;
 
@@ -94,10 +209,12 @@ namespace BuildModeNoAutoZoom
             {
                 bool buildActive = IsBuild();
 
+                // Normal build enter/exit handling
                 if (buildActive != _lastBuildActive)
                 {
                     if (buildActive)
                     {
+                        // On normal entry, baseline from last non-build snapshots we already have
                         foreach (var kv in _states)
                         {
                             var s = kv.Value;
@@ -108,11 +225,14 @@ namespace BuildModeNoAutoZoom
                     }
                     else
                     {
-                        foreach (var kv in _states) kv.Value.PinActive = false;
+                        DisarmPinning();
                     }
 
                     _lastBuildActive = buildActive;
                 }
+
+                // Track this blender instance
+                if (__instance == null) return;
 
                 if (!_states.TryGetValue(__instance, out var st))
                 {
@@ -125,23 +245,31 @@ namespace BuildModeNoAutoZoom
 
                 int idx = (int)st.IndexField.GetValue(__instance);
 
-                // Always keep the non-build snapshot up to date
-                if (!buildActive)
+                // Update non-build snapshot whenever we are not in build mode and not in forced window
+                if (!buildActive && _forcedPinFrames <= 0)
                 {
                     st.LastNonBuildIndex = idx;
                     st.HasNonBuild = true;
                     return;
                 }
 
-                // BUGFIX (1.0.1):
-                // Blueprint tools rely on the build/RTS camera profile for keyboard panning.
-                // If we pin the pose selector during blueprint placement/paste, panning breaks.
-                // So: do not pin while a blueprint tool is active.
-                if (IsBlueprintToolActive())
+                // Blueprint exception: do not pin during blueprint tools (keeps keyboard panning)
+                if ((buildActive || _forcedPinFrames > 0) && IsBlueprintToolActive())
+                {
+                    // If we’re in forced window, let it expire naturally
+                    if (_forcedPinFrames > 0) _forcedPinFrames--;
                     return;
+                }
 
-                if (st.PinActive && idx != st.Baseline)
+                // Enforce pinning during build mode OR during the short forced window
+                if ((buildActive || _forcedPinFrames > 0) && st.PinActive && idx != st.Baseline)
                     st.IndexField.SetValue(__instance, st.Baseline);
+
+                if (_forcedPinFrames > 0) _forcedPinFrames--;
+
+                // Once forced window ends and build is still not active, disarm
+                if (_forcedPinFrames <= 0 && !buildActive)
+                    DisarmPinning();
             }
             catch { }
         }
@@ -166,8 +294,6 @@ namespace BuildModeNoAutoZoom
                 var tool = ab?.activeTool;
                 if (tool == null) return false;
 
-                // Defensive + version-tolerant:
-                // DSP blueprint tools/classes typically contain "Blueprint" in the type name.
                 string tn = tool.GetType().Name;
                 return tn.IndexOf("Blueprint", StringComparison.OrdinalIgnoreCase) >= 0;
             }
@@ -207,6 +333,8 @@ namespace BuildModeNoAutoZoom
                 var fWanted = AccessTools.Field(t, "distCoefWanted");
                 var fBegin = AccessTools.Field(t, "distCoefBegin");
 
+                if (fMin == null || fMax == null || fDist == null || fCoef == null) return;
+
                 float min = (float)fMin.GetValue(__instance);
                 float max = (float)fMax.GetValue(__instance);
                 float dist = (float)fDist.GetValue(__instance);
@@ -217,7 +345,6 @@ namespace BuildModeNoAutoZoom
                 float span = newMax - min;
                 if (span <= 0.0001f) return;
 
-                // Assume normal mapping: dist = min + span*coef
                 float coef = (dist - min) / span;
                 if (coef < 0f) coef = 0f; else if (coef > 1f) coef = 1f;
 
