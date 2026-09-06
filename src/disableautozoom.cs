@@ -1,402 +1,468 @@
-﻿// BuildModeNoAutoZoom.cs
-//
-// BepInEx 5.x / HarmonyX, C# 7.3
-
-
-
 using BepInEx;
 using BepInEx.Configuration;
+using BepInEx.Logging;
 using HarmonyLib;
 using System;
 using System.Collections.Generic;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using UnityEngine;
 
 namespace BuildModeNoAutoZoom
 {
     [BepInPlugin(PluginGuid, PluginName, PluginVersion)]
-    public class BuildModeNoAutoZoomPlugin : BaseUnityPlugin
+    public sealed class BuildModeNoAutoZoomPlugin : BaseUnityPlugin
     {
-
-        public const string PluginGuid = "nekogod.dsp.buildmode.noautozoom";
+        public const string PluginGuid = "lee.dsp.buildmode.noautozoom";
         public const string PluginName = "DSP Build Mode No AutoZoom";
-        public const string PluginVersion = "1.0.3";
+        public const string PluginVersion = "1.0.4";
 
         internal static ConfigEntry<bool> Enabled;
         internal static ConfigEntry<float> ExtraMaxZoomOut;
-
-        // Short enforcement window for Shift+LMB path (frames).
-        // Build mode may become active a few frames after the click; this bridges that gap.
         internal static ConfigEntry<int> ShiftClickPinFrames;
+        internal static ManualLogSource Log;
+
+        private static bool _cameraPinAvailable;
 
         private void Awake()
         {
-            Enabled = Config.Bind("General", "Enabled", true, "Enable mod.");
+            Log = Logger;
+            Enabled = Config.Bind("General", "Enabled", true, "Enable the mod.");
             ExtraMaxZoomOut = Config.Bind("General", "ExtraMaxZoomOut", 2f,
-                "Permanent extra max zoom-out distance (meters). 0 disables.");
-            ShiftClickPinFrames = Config.Bind("General", "ShiftClickPinFrames", 8, "How many frames to enforce the non-build camera pose after Shift+LMB (covers shift-click entry path). -Shouldn't need changing, but increase if you still see auto zooming when shift+clicking.");
+                "Permanent extra maximum zoom-out distance in metres. Set to 0 to disable.");
+            ShiftClickPinFrames = Config.Bind("General", "ShiftClickPinFrames", 8,
+                "How long to preserve the camera pose while Shift-click enters build mode.");
 
-            var h = new Harmony(PluginGuid);
+            var harmony = new Harmony(PluginGuid);
+            string cameraStatus;
+            _cameraPinAvailable = TryPatchCameraPin(harmony, out cameraStatus);
 
-            // Patch CameraPoseBlender.Calculate (core hook for pinning the pose index).
-            var mCalc = AccessTools.Method(typeof(CameraPoseBlender), "Calculate");
-            if (mCalc != null)
-            {
-                var pre = new HarmonyMethod(typeof(BlenderPinPatches),
-                    nameof(BlenderPinPatches.CameraPoseBlender_Calculate_Prefix));
-                h.Patch(mCalc, prefix: pre);
-            }
+            string rtsStatus;
+            string prtsStatus;
+            TryPatchPoser(harmony, "RTSPoser", out rtsStatus);
+            TryPatchPoser(harmony, "PRTSPoser", out prtsStatus);
 
-            // Patch RTSPoser.Calculate / PRTSPoser.Calculate (if present) to apply a permanent max zoom-out extension.
-            PatchPoserByExactTypeNameFromAssemblyCSharp(h, "RTSPoser");
-            PatchPoserByExactTypeNameFromAssemblyCSharp(h, "PRTSPoser");
+            Logger.LogInfo(string.Format(
+                "Compatibility: camera pin={0}; RTS zoom={1}; PRTS zoom={2}.",
+                cameraStatus, rtsStatus, prtsStatus));
         }
 
         private void Update()
         {
-            if (!Enabled.Value) return;
-
-            // Detect Shift+LMB before build mode becomes active.
-            if (!Input.GetMouseButtonDown(0)) return;
-            if (!(Input.GetKey(KeyCode.LeftShift) || Input.GetKey(KeyCode.RightShift))) return;
-
-            // Avoid interfering if a blueprint tool is already active (rare but harmless).
-            if (BlenderPinPatches.IsBlueprintToolActive_Public())
+            if (!_cameraPinAvailable || !Enabled.Value || !Input.GetMouseButtonDown(0))
                 return;
 
-            BlenderPinPatches.OnShiftClick_Public();
+            if (!Input.GetKey(KeyCode.LeftShift) && !Input.GetKey(KeyCode.RightShift))
+                return;
+
+            if (!BlenderPinPatches.IsBlueprintToolActive())
+                BlenderPinPatches.OnShiftClick();
         }
 
-        private static void PatchPoserByExactTypeNameFromAssemblyCSharp(Harmony h, string typeName)
+        private bool TryPatchCameraPin(Harmony harmony, out string status)
         {
+            string error;
+            if (!BlenderPinPatches.TryInitialize(out error))
+            {
+                status = "disabled (" + error + ")";
+                Logger.LogWarning("Camera pin disabled: " + error + ".");
+                return false;
+            }
+
+            MethodInfo calculate = AccessTools.Method(typeof(CameraPoseBlender), "Calculate");
+            if (calculate == null)
+            {
+                status = "disabled (Calculate missing)";
+                Logger.LogWarning("Camera pin disabled: CameraPoseBlender.Calculate was not found.");
+                return false;
+            }
+
             try
             {
-                var asm = FindAssembly("Assembly-CSharp");
-                if (asm == null) return;
-
-                var t = asm.GetType(typeName, false);
-                if (t == null) return;
-
-                var m = AccessTools.Method(t, "Calculate");
-                if (m == null) return;
-
-                // Require core float fields. If they aren't present, skip patching safely.
-                var fMax = AccessTools.Field(t, "distMax");
-                var fMin = AccessTools.Field(t, "distMin");
-                var fDist = AccessTools.Field(t, "dist");
-                var fCoef = AccessTools.Field(t, "distCoef");
-                if (fMax == null || fMax.FieldType != typeof(float)) return;
-                if (fMin == null || fMin.FieldType != typeof(float)) return;
-                if (fDist == null || fDist.FieldType != typeof(float)) return;
-                if (fCoef == null || fCoef.FieldType != typeof(float)) return;
-
-                var pre = new HarmonyMethod(typeof(PermanentZoomPatches),
-                    nameof(PermanentZoomPatches.Calculate_Prefix));
-                h.Patch(m, prefix: pre);
+                harmony.Patch(calculate, prefix: new HarmonyMethod(
+                    typeof(BlenderPinPatches), nameof(BlenderPinPatches.CalculatePrefix)));
+                status = "enabled";
+                return true;
             }
-            catch
+            catch (Exception ex)
             {
-                // Silent: failing to patch poser types should never break gameplay.
+                status = "disabled (patch failed)";
+                Logger.LogWarning("Camera pin disabled because its Harmony patch failed: " + ex.Message);
+                return false;
             }
         }
 
-        private static Assembly FindAssembly(string simpleName)
+        private bool TryPatchPoser(Harmony harmony, string typeName, out string status)
         {
+            Type type = typeof(CameraPoseBlender).Assembly.GetType(typeName, false);
+            if (type == null)
+            {
+                status = "unavailable";
+                return false;
+            }
+
+            MethodInfo calculate = AccessTools.Method(type, "Calculate");
+            if (calculate == null)
+            {
+                status = "disabled (Calculate missing)";
+                Logger.LogWarning(typeName + " zoom extension disabled: Calculate missing.");
+                return false;
+            }
+
+            PoserFields fields;
+            string error;
+            if (!PoserFields.TryCreate(type, out fields, out error))
+            {
+                status = "disabled (" + error + ")";
+                Logger.LogWarning(typeName + " zoom extension disabled: " + error + ".");
+                return false;
+            }
+
             try
             {
-                var asms = AppDomain.CurrentDomain.GetAssemblies();
-                for (int i = 0; i < asms.Length; i++)
-                {
-                    var a = asms[i];
-                    if (a == null) continue;
-                    var n = a.GetName().Name;
-                    if (string.Equals(n, simpleName, StringComparison.OrdinalIgnoreCase))
-                        return a;
-                }
+                PermanentZoomPatches.Register(type, fields);
+                harmony.Patch(calculate, prefix: new HarmonyMethod(
+                    typeof(PermanentZoomPatches), nameof(PermanentZoomPatches.CalculatePrefix)));
+                status = "enabled";
+                return true;
             }
-            catch { }
-            return null;
+            catch (Exception ex)
+            {
+                PermanentZoomPatches.Unregister(type);
+                status = "disabled (patch failed)";
+                Logger.LogWarning(typeName + " zoom extension disabled because its Harmony patch failed: " + ex.Message);
+                return false;
+            }
+        }
+    }
+
+    internal sealed class ReferenceComparer<T> : IEqualityComparer<T> where T : class
+    {
+        internal static readonly ReferenceComparer<T> Instance = new ReferenceComparer<T>();
+
+        public bool Equals(T x, T y)
+        {
+            return ReferenceEquals(x, y);
+        }
+
+        public int GetHashCode(T obj)
+        {
+            return RuntimeHelpers.GetHashCode(obj);
         }
     }
 
     internal static class BlenderPinPatches
     {
-        // Reference-identity comparer for Unity objects (fast, stable).
-        private sealed class RefEq<T> : IEqualityComparer<T> where T : class
-        {
-            public static readonly RefEq<T> Instance = new RefEq<T>();
-            public bool Equals(T x, T y) => ReferenceEquals(x, y);
-            public int GetHashCode(T obj) => System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(obj);
-        }
-
         private sealed class BlenderState
         {
-            // Last known "non-build" pose index (captured while not building).
-            public int LastNonBuildIndex;
-            public bool HasNonBuild;
-
-            // Baseline pose index we pin to while building / during forced window.
-            public int Baseline;
-            public bool PinActive;
-
-            // Epoch markers (avoid O(N) loops on build enter/exit).
-            public int BuildEpochApplied;
-            public int ShiftEpochApplied;
+            internal int LastNonBuildIndex;
+            internal bool HasNonBuildIndex;
+            internal int Baseline;
+            internal bool PinActive;
+            internal int BuildEpochApplied;
         }
 
-        // Fast access to CameraPoseBlender.index (no reflection, no boxing).
-        private static readonly AccessTools.FieldRef<CameraPoseBlender, int> IndexRef =
-            AccessTools.FieldRefAccess<CameraPoseBlender, int>("index");
+        private static AccessTools.FieldRef<CameraPoseBlender, int> _index;
+        private static readonly Dictionary<CameraPoseBlender, BlenderState> States =
+            new Dictionary<CameraPoseBlender, BlenderState>(ReferenceComparer<CameraPoseBlender>.Instance);
+        private static readonly List<CameraPoseBlender> DeadBlenders = new List<CameraPoseBlender>(64);
+        private static readonly Dictionary<Type, bool> BlueprintTypes = new Dictionary<Type, bool>(16);
 
-        // Track blender -> state. We prune occasionally to avoid unbounded growth.
-        private static readonly Dictionary<CameraPoseBlender, BlenderState> _states =
-            new Dictionary<CameraPoseBlender, BlenderState>(RefEq<CameraPoseBlender>.Instance);
-
-        // Build state tracking.
         private static bool _lastBuildActive;
         private static int _buildEpoch;
-
-        // Shift-click enforcement window (frames). While > 0, we pin even if buildActive is still false.
         private static int _forcedPinFrames;
+        private static int _lastForcedPinFrame = -1;
+        private static int _pruneCountdown = 600;
 
-        // Shift snapshot epoch counter.
-        private static int _shiftEpoch;
-
-        // Occasional pruning so _states doesn't grow unbounded over long sessions.
-        private static int _pruneCountdown = 600; // ~once per 600 Calculate calls
-        private static readonly List<CameraPoseBlender> _pruneKeys = new List<CameraPoseBlender>(64);
-
-        // Cache: BuildTool Type -> "is blueprint tool?"
-        private static readonly Dictionary<Type, bool> _blueprintTypeCache = new Dictionary<Type, bool>(16);
-
-        internal static void OnShiftClick_Public()
+        internal static bool TryInitialize(out string error)
         {
-            // Shift-click path:
-            // - Snapshot current (non-build) pose index immediately for *all* blenders
-            // - Arm pinning based on that snapshot
-            // - Start a short enforcement window bridging the few frames before buildActive flips true
-            _shiftEpoch++;
-            SnapshotAllBlendersAsNonBuildAndArmShiftEpoch(_shiftEpoch);
-            _forcedPinFrames = Math.Max(1, BuildModeNoAutoZoomPlugin.ShiftClickPinFrames.Value);
-        }
+            FieldInfo indexField = AccessTools.Field(typeof(CameraPoseBlender), "index");
+            if (indexField == null || indexField.FieldType != typeof(int))
+            {
+                error = "CameraPoseBlender.index is missing or incompatible";
+                return false;
+            }
 
-        internal static bool IsBlueprintToolActive_Public() => IsBlueprintToolActive();
+            FieldInfo actionBuild = AccessTools.Field(typeof(PlayerController), "actionBuild");
+            if (actionBuild == null || actionBuild.FieldType != typeof(PlayerAction_Build))
+            {
+                error = "PlayerController.actionBuild is missing or incompatible";
+                return false;
+            }
 
-        private static void SnapshotAllBlendersAsNonBuildAndArmShiftEpoch(int shiftEpoch)
-        {
+            MemberInfo active = (MemberInfo)AccessTools.Property(typeof(PlayerAction_Build), "active")
+                ?? AccessTools.Field(typeof(PlayerAction_Build), "active")
+                ?? AccessTools.Field(typeof(PlayerAction_Build), "<active>k__BackingField");
+            if (GetMemberType(active) != typeof(bool))
+            {
+                error = "PlayerAction_Build.active is missing or incompatible";
+                return false;
+            }
+
+            if (AccessTools.Field(typeof(PlayerAction_Build), "activeTool") == null)
+            {
+                error = "PlayerAction_Build.activeTool is missing";
+                return false;
+            }
+
             try
             {
-                var blenders = Resources.FindObjectsOfTypeAll<CameraPoseBlender>();
-                if (blenders == null) return;
-
-                for (int i = 0; i < blenders.Length; i++)
-                {
-                    var b = blenders[i];
-                    if (b == null) continue;
-
-                    if (!_states.TryGetValue(b, out var st))
-                    {
-                        st = new BlenderState();
-                        _states[b] = st;
-                    }
-
-                    // Snapshot current index as a "non-build" baseline.
-                    int idx = IndexRef(b);
-                    st.LastNonBuildIndex = idx;
-                    st.HasNonBuild = true;
-
-                    // Arm pinning immediately from this snapshot for the forced window.
-                    st.Baseline = idx;
-                    st.PinActive = true;
-                    st.ShiftEpochApplied = shiftEpoch;
-                }
+                _index = AccessTools.FieldRefAccess<CameraPoseBlender, int>("index");
+                error = null;
+                return true;
             }
-            catch
+            catch (Exception ex)
             {
-                // Silent: snapshot is an optimization for a specific entry path; failure should not break gameplay.
+                error = "CameraPoseBlender.index accessor failed: " + ex.Message;
+                return false;
             }
         }
 
-        public static void CameraPoseBlender_Calculate_Prefix(CameraPoseBlender __instance)
+        private static Type GetMemberType(MemberInfo member)
         {
-            if (__instance == null) return;
+            PropertyInfo property = member as PropertyInfo;
+            if (property != null)
+                return property.PropertyType;
 
-            PruneDeadOccasionally();
+            FieldInfo field = member as FieldInfo;
+            return field == null ? null : field.FieldType;
+        }
 
-            if (!BuildModeNoAutoZoomPlugin.Enabled.Value) return;
+        internal static void OnShiftClick()
+        {
+            CameraPoseBlender[] blenders = Resources.FindObjectsOfTypeAll<CameraPoseBlender>();
+            if (blenders == null)
+                return;
 
-            bool buildActive = IsBuild();
+            for (int i = 0; i < blenders.Length; i++)
+            {
+                CameraPoseBlender blender = blenders[i];
+                if (blender == null)
+                    continue;
 
-            // On build enter/exit we do NOT loop over all blenders.
-            // Instead we bump an epoch on entry; each blender lazily initializes its baseline once per epoch.
+                BlenderState state = GetState(blender);
+                int index = _index(blender);
+                state.LastNonBuildIndex = index;
+                state.HasNonBuildIndex = true;
+                state.Baseline = index;
+                state.PinActive = true;
+            }
+
+            _forcedPinFrames = Math.Max(1, BuildModeNoAutoZoomPlugin.ShiftClickPinFrames.Value);
+            _lastForcedPinFrame = Time.frameCount;
+        }
+
+        internal static bool IsBlueprintToolActive()
+        {
+            var tool = GameMain.mainPlayer?.controller?.actionBuild?.activeTool;
+            if (tool == null)
+                return false;
+
+            Type type = tool.GetType();
+            bool isBlueprint;
+            if (!BlueprintTypes.TryGetValue(type, out isBlueprint))
+            {
+                isBlueprint = type.Name.IndexOf("Blueprint", StringComparison.OrdinalIgnoreCase) >= 0;
+                BlueprintTypes[type] = isBlueprint;
+            }
+
+            return isBlueprint;
+        }
+
+        public static void CalculatePrefix(CameraPoseBlender __instance)
+        {
+            if (__instance == null || !BuildModeNoAutoZoomPlugin.Enabled.Value)
+                return;
+
+            AdvanceForcedPinWindow();
+            PruneDeadBlenders();
+
+            bool buildActive = IsBuildModeActive();
             if (buildActive != _lastBuildActive)
             {
                 _lastBuildActive = buildActive;
                 if (buildActive)
                     _buildEpoch++;
-                // On exit: no work here; each blender self-disarms when it runs next in non-build.
             }
 
-            if (!_states.TryGetValue(__instance, out var st))
-            {
-                st = new BlenderState();
-                _states[__instance] = st;
-            }
+            BlenderState state = GetState(__instance);
+            int currentIndex = _index(__instance);
 
-            int idxNow = IndexRef(__instance);
-
-            // In true non-build and not in forced window:
-            // - record snapshot (authoritative "non-build pose")
-            // - disarm pinning for this blender (lazy, per-instance)
             if (!buildActive && _forcedPinFrames <= 0)
             {
-                st.LastNonBuildIndex = idxNow;
-                st.HasNonBuild = true;
-                st.PinActive = false;
+                state.LastNonBuildIndex = currentIndex;
+                state.HasNonBuildIndex = true;
+                state.PinActive = false;
                 return;
             }
 
-            // Blueprint tools: don't pin (keeps blueprint keyboard/mouse behaviour intact).
-            if ((buildActive || _forcedPinFrames > 0) && IsBlueprintToolActive())
-            {
-                if (_forcedPinFrames > 0) _forcedPinFrames--;
+            if (IsBlueprintToolActive())
                 return;
+
+            if (buildActive && state.BuildEpochApplied != _buildEpoch)
+            {
+                state.BuildEpochApplied = _buildEpoch;
+                state.Baseline = state.HasNonBuildIndex ? state.LastNonBuildIndex : currentIndex;
+                state.PinActive = true;
+            }
+            else if (!buildActive && _forcedPinFrames > 0 && !state.PinActive)
+            {
+                state.Baseline = state.HasNonBuildIndex ? state.LastNonBuildIndex : currentIndex;
+                state.PinActive = true;
             }
 
-            // If we are in build mode, lazily initialize baseline once per build epoch.
-            if (buildActive && st.BuildEpochApplied != _buildEpoch)
-            {
-                st.BuildEpochApplied = _buildEpoch;
+            if (state.PinActive && currentIndex != state.Baseline)
+                _index(__instance) = state.Baseline;
+        }
 
-                // Prefer last known non-build snapshot; otherwise fall back to current index.
-                st.Baseline = st.HasNonBuild ? st.LastNonBuildIndex : idxNow;
-                st.PinActive = true;
+        private static BlenderState GetState(CameraPoseBlender blender)
+        {
+            BlenderState state;
+            if (!States.TryGetValue(blender, out state))
+            {
+                state = new BlenderState();
+                States.Add(blender, state);
             }
 
-            // If build isn't active yet but we're within forced window, ensure pinning is armed.
-            // (Normally shift snapshot already did this; this is a safety net.)
-            if (!buildActive && _forcedPinFrames > 0 && !st.PinActive)
-            {
-                st.Baseline = st.HasNonBuild ? st.LastNonBuildIndex : idxNow;
-                st.PinActive = true;
-            }
+            return state;
+        }
 
-            // Enforce pinning during build mode OR during the short forced window.
-            if ((buildActive || _forcedPinFrames > 0) && st.PinActive && idxNow != st.Baseline)
-            {
-                IndexRef(__instance) = st.Baseline;
-            }
+        private static bool IsBuildModeActive()
+        {
+            PlayerAction_Build actionBuild = GameMain.mainPlayer?.controller?.actionBuild;
+            return actionBuild != null && actionBuild.active;
+        }
 
-            if (_forcedPinFrames > 0) _forcedPinFrames--;
-
-            // Once forced window ends and build still isn't active, self-disarm (no global loop).
-            if (_forcedPinFrames <= 0 && !buildActive)
+        private static void AdvanceForcedPinWindow()
+        {
+            int frame = Time.frameCount;
+            if (_forcedPinFrames > 0 && frame != _lastForcedPinFrame)
             {
-                st.PinActive = false;
+                _forcedPinFrames--;
+                _lastForcedPinFrame = frame;
             }
         }
 
-        private static void PruneDeadOccasionally()
+        private static void PruneDeadBlenders()
         {
-            if (--_pruneCountdown > 0) return;
+            if (--_pruneCountdown > 0)
+                return;
+
             _pruneCountdown = 600;
-
-            _pruneKeys.Clear();
-            foreach (var kv in _states)
+            DeadBlenders.Clear();
+            foreach (KeyValuePair<CameraPoseBlender, BlenderState> entry in States)
             {
-                // Unity destroyed objects compare equal to null
-                if (kv.Key == null) _pruneKeys.Add(kv.Key);
+                if (entry.Key == null)
+                    DeadBlenders.Add(entry.Key);
             }
 
-            for (int i = 0; i < _pruneKeys.Count; i++)
-                _states.Remove(_pruneKeys[i]);
+            for (int i = 0; i < DeadBlenders.Count; i++)
+                States.Remove(DeadBlenders[i]);
+        }
+    }
+
+    internal sealed class PoserFields
+    {
+        internal readonly FieldInfo Minimum;
+        internal readonly FieldInfo Maximum;
+        internal readonly FieldInfo Distance;
+        internal readonly FieldInfo Coefficient;
+        internal readonly FieldInfo WantedCoefficient;
+        internal readonly FieldInfo BeginCoefficient;
+
+        private PoserFields(Type type)
+        {
+            Minimum = AccessTools.Field(type, "distMin");
+            Maximum = AccessTools.Field(type, "distMax");
+            Distance = AccessTools.Field(type, "dist");
+            Coefficient = AccessTools.Field(type, "distCoef");
+            WantedCoefficient = GetOptionalFloatField(type, "distCoefWanted");
+            BeginCoefficient = GetOptionalFloatField(type, "distCoefBegin");
         }
 
-        private static bool IsBuild()
+        internal static bool TryCreate(Type type, out PoserFields fields, out string error)
         {
-            var p = GameMain.mainPlayer;
-            var ab = p?.controller?.actionBuild;
-            return ab != null && ab.active;
+            fields = new PoserFields(type);
+            if (!IsFloat(fields.Minimum) || !IsFloat(fields.Maximum) ||
+                !IsFloat(fields.Distance) || !IsFloat(fields.Coefficient))
+            {
+                fields = null;
+                error = "required distance fields are missing or incompatible";
+                return false;
+            }
+
+            error = null;
+            return true;
         }
 
-        private static bool IsBlueprintToolActive()
+        private static bool IsFloat(FieldInfo field)
         {
-            var tool = GameMain.mainPlayer?.controller?.actionBuild?.activeTool;
-            if (tool == null) return false;
+            return field != null && field.FieldType == typeof(float);
+        }
 
-            var t = tool.GetType();
-            if (_blueprintTypeCache.TryGetValue(t, out var cached)) return cached;
-
-            bool isBp = t.Name.IndexOf("Blueprint", StringComparison.OrdinalIgnoreCase) >= 0;
-            _blueprintTypeCache[t] = isBp;
-            return isBp;
+        private static FieldInfo GetOptionalFloatField(Type type, string name)
+        {
+            FieldInfo field = AccessTools.Field(type, name);
+            return IsFloat(field) ? field : null;
         }
     }
 
     internal static class PermanentZoomPatches
     {
-        // Reference-identity comparer for "Done" set.
-        private sealed class RefEq<T> : IEqualityComparer<T> where T : class
+        private static readonly Dictionary<Type, PoserFields> Fields = new Dictionary<Type, PoserFields>(2);
+        private static readonly HashSet<object> Completed =
+            new HashSet<object>(ReferenceComparer<object>.Instance);
+        private static readonly HashSet<Type> Failed = new HashSet<Type>();
+
+        internal static void Register(Type type, PoserFields fields)
         {
-            public static readonly RefEq<T> Instance = new RefEq<T>();
-            public bool Equals(T x, T y) => ReferenceEquals(x, y);
-            public int GetHashCode(T obj) => System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(obj);
+            Fields[type] = fields;
         }
 
-        // Apply zoom extension only once per poser instance.
-        private static readonly HashSet<object> Done = new HashSet<object>(RefEq<object>.Instance);
-
-        [HarmonyPrefix]
-        public static void Calculate_Prefix(object __instance)
+        internal static void Unregister(Type type)
         {
-            if (!BuildModeNoAutoZoomPlugin.Enabled.Value) return;
+            Fields.Remove(type);
+        }
+
+        public static void CalculatePrefix(object __instance)
+        {
+            if (!BuildModeNoAutoZoomPlugin.Enabled.Value || __instance == null)
+                return;
 
             float extra = BuildModeNoAutoZoomPlugin.ExtraMaxZoomOut.Value;
-            if (extra <= 0.0001f) return;
+            if (extra <= 0.0001f || Completed.Contains(__instance))
+                return;
 
-            if (!Done.Add(__instance)) return; // once per instance
+            Type type = __instance.GetType();
+            PoserFields fields;
+            if (Failed.Contains(type) || !Fields.TryGetValue(type, out fields))
+                return;
 
             try
             {
-                var t = __instance.GetType();
+                float minimum = (float)fields.Minimum.GetValue(__instance);
+                float maximum = (float)fields.Maximum.GetValue(__instance);
+                float distance = (float)fields.Distance.GetValue(__instance);
+                float newMaximum = maximum + extra;
+                float span = newMaximum - minimum;
+                if (span <= 0.0001f)
+                    return;
 
-                // Core fields required for the zoom tweak.
-                var fMin = AccessTools.Field(t, "distMin");
-                var fMax = AccessTools.Field(t, "distMax");
-                var fDist = AccessTools.Field(t, "dist");
-                var fCoef = AccessTools.Field(t, "distCoef");
+                float coefficient = Mathf.Clamp01((distance - minimum) / span);
+                fields.Maximum.SetValue(__instance, newMaximum);
+                fields.Coefficient.SetValue(__instance, coefficient);
+                if (fields.WantedCoefficient != null)
+                    fields.WantedCoefficient.SetValue(__instance, coefficient);
+                if (fields.BeginCoefficient != null)
+                    fields.BeginCoefficient.SetValue(__instance, coefficient);
 
-                // Optional fields (not always present across versions/types).
-                var fWanted = AccessTools.Field(t, "distCoefWanted");
-                var fBegin = AccessTools.Field(t, "distCoefBegin");
-
-                if (fMin == null || fMax == null || fDist == null || fCoef == null) return;
-
-                float min = (float)fMin.GetValue(__instance);
-                float max = (float)fMax.GetValue(__instance);
-                float dist = (float)fDist.GetValue(__instance);
-
-                // Extend max distance.
-                float newMax = max + extra;
-                fMax.SetValue(__instance, newMax);
-
-                // Recompute normalized coefficient so current dist maps correctly into [min..newMax].
-                float span = newMax - min;
-                if (span <= 0.0001f) return;
-
-                float coef = (dist - min) / span;
-                if (coef < 0f) coef = 0f;
-                else if (coef > 1f) coef = 1f;
-
-                fCoef.SetValue(__instance, coef);
-
-                // Keep internal lerp/transition fields consistent if they exist.
-                if (fWanted != null && fWanted.FieldType == typeof(float)) fWanted.SetValue(__instance, coef);
-                if (fBegin != null && fBegin.FieldType == typeof(float)) fBegin.SetValue(__instance, coef);
+                Completed.Add(__instance);
             }
-            catch
+            catch (Exception ex)
             {
-                // Silent: if this fails for a poser type, it should never affect core gameplay.
+                Failed.Add(type);
+                BuildModeNoAutoZoomPlugin.Log.LogWarning(
+                    type.Name + " zoom extension disabled after a runtime compatibility failure: " + ex.Message);
             }
         }
     }
