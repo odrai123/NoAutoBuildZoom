@@ -15,7 +15,7 @@ namespace BuildModeNoAutoZoom
     {
         public const string PluginGuid = "lee.dsp.buildmode.noautozoom";
         public const string PluginName = "DSP Build Mode No AutoZoom";
-        public const string PluginVersion = "1.0.4";
+        public const string PluginVersion = "1.0.6";
 
         internal static ConfigEntry<bool> Enabled;
         internal static ConfigEntry<float> ExtraMaxZoomOut;
@@ -55,7 +55,7 @@ namespace BuildModeNoAutoZoom
             if (!Input.GetKey(KeyCode.LeftShift) && !Input.GetKey(KeyCode.RightShift))
                 return;
 
-            if (!BlenderPinPatches.IsBlueprintToolActive())
+            if (!BlenderPinPatches.IsBlueprintModeActive())
                 BlenderPinPatches.OnShiftClick();
         }
 
@@ -159,17 +159,15 @@ namespace BuildModeNoAutoZoom
             internal bool HasNonBuildIndex;
             internal int Baseline;
             internal bool PinActive;
-            internal int BuildEpochApplied;
+            internal int ProtectedEpochApplied;
         }
 
         private static AccessTools.FieldRef<CameraPoseBlender, int> _index;
         private static readonly Dictionary<CameraPoseBlender, BlenderState> States =
             new Dictionary<CameraPoseBlender, BlenderState>(ReferenceComparer<CameraPoseBlender>.Instance);
         private static readonly List<CameraPoseBlender> DeadBlenders = new List<CameraPoseBlender>(64);
-        private static readonly Dictionary<Type, bool> BlueprintTypes = new Dictionary<Type, bool>(16);
-
-        private static bool _lastBuildActive;
-        private static int _buildEpoch;
+        private static bool _lastProtectedActive;
+        private static int _protectedEpoch;
         private static int _forcedPinFrames;
         private static int _lastForcedPinFrame = -1;
         private static int _pruneCountdown = 600;
@@ -199,9 +197,33 @@ namespace BuildModeNoAutoZoom
                 return false;
             }
 
-            if (AccessTools.Field(typeof(PlayerAction_Build), "activeTool") == null)
+            FieldInfo command = AccessTools.Field(typeof(PlayerController), "cmd");
+            if (command == null || command.FieldType != typeof(CommandState))
             {
-                error = "PlayerAction_Build.activeTool is missing";
+                error = "PlayerController.cmd is missing or incompatible";
+                return false;
+            }
+
+            FieldInfo commandType = AccessTools.Field(typeof(CommandState), "type");
+            if (commandType == null || commandType.FieldType != typeof(ECommand))
+            {
+                error = "CommandState.type is missing or incompatible";
+                return false;
+            }
+
+            MemberInfo blueprintMode = (MemberInfo)AccessTools.Property(typeof(PlayerAction_Build), "blueprintMode")
+                ?? AccessTools.Field(typeof(PlayerAction_Build), "blueprintMode")
+                ?? AccessTools.Field(typeof(PlayerAction_Build), "<blueprintMode>k__BackingField");
+            if (GetMemberType(blueprintMode) != typeof(EBlueprintMode))
+            {
+                error = "PlayerAction_Build.blueprintMode is missing or incompatible";
+                return false;
+            }
+
+            FieldInfo viewMode = AccessTools.Field(typeof(UIGame), "viewMode");
+            if (viewMode == null || viewMode.FieldType != typeof(EViewMode))
+            {
+                error = "UIGame.viewMode is missing or incompatible";
                 return false;
             }
 
@@ -252,21 +274,10 @@ namespace BuildModeNoAutoZoom
             _lastForcedPinFrame = Time.frameCount;
         }
 
-        internal static bool IsBlueprintToolActive()
+        internal static bool IsBlueprintModeActive()
         {
-            var tool = GameMain.mainPlayer?.controller?.actionBuild?.activeTool;
-            if (tool == null)
-                return false;
-
-            Type type = tool.GetType();
-            bool isBlueprint;
-            if (!BlueprintTypes.TryGetValue(type, out isBlueprint))
-            {
-                isBlueprint = type.Name.IndexOf("Blueprint", StringComparison.OrdinalIgnoreCase) >= 0;
-                BlueprintTypes[type] = isBlueprint;
-            }
-
-            return isBlueprint;
+            PlayerAction_Build actionBuild = GameMain.mainPlayer?.controller?.actionBuild;
+            return actionBuild != null && actionBuild.blueprintMode != EBlueprintMode.None;
         }
 
         public static void CalculatePrefix(CameraPoseBlender __instance)
@@ -277,18 +288,18 @@ namespace BuildModeNoAutoZoom
             AdvanceForcedPinWindow();
             PruneDeadBlenders();
 
-            bool buildActive = IsBuildModeActive();
-            if (buildActive != _lastBuildActive)
+            bool protectedActive = IsProtectedCameraModeActive();
+            if (protectedActive != _lastProtectedActive)
             {
-                _lastBuildActive = buildActive;
-                if (buildActive)
-                    _buildEpoch++;
+                _lastProtectedActive = protectedActive;
+                if (protectedActive)
+                    _protectedEpoch++;
             }
 
             BlenderState state = GetState(__instance);
             int currentIndex = _index(__instance);
 
-            if (!buildActive && _forcedPinFrames <= 0)
+            if (!protectedActive && _forcedPinFrames <= 0)
             {
                 state.LastNonBuildIndex = currentIndex;
                 state.HasNonBuildIndex = true;
@@ -296,16 +307,16 @@ namespace BuildModeNoAutoZoom
                 return;
             }
 
-            if (IsBlueprintToolActive())
+            if (IsBlueprintModeActive())
                 return;
 
-            if (buildActive && state.BuildEpochApplied != _buildEpoch)
+            if (protectedActive && state.ProtectedEpochApplied != _protectedEpoch)
             {
-                state.BuildEpochApplied = _buildEpoch;
+                state.ProtectedEpochApplied = _protectedEpoch;
                 state.Baseline = state.HasNonBuildIndex ? state.LastNonBuildIndex : currentIndex;
                 state.PinActive = true;
             }
-            else if (!buildActive && _forcedPinFrames > 0 && !state.PinActive)
+            else if (!protectedActive && _forcedPinFrames > 0 && !state.PinActive)
             {
                 state.Baseline = state.HasNonBuildIndex ? state.LastNonBuildIndex : currentIndex;
                 state.PinActive = true;
@@ -327,10 +338,16 @@ namespace BuildModeNoAutoZoom
             return state;
         }
 
-        private static bool IsBuildModeActive()
+        private static bool IsProtectedCameraModeActive()
         {
-            PlayerAction_Build actionBuild = GameMain.mainPlayer?.controller?.actionBuild;
-            return actionBuild != null && actionBuild.active;
+            PlayerController controller = GameMain.mainPlayer?.controller;
+            if (controller == null)
+                return false;
+
+            PlayerAction_Build actionBuild = controller.actionBuild;
+            return controller.cmd.type == ECommand.Build ||
+                UIGame.viewMode == EViewMode.Build ||
+                (actionBuild != null && actionBuild.active);
         }
 
         private static void AdvanceForcedPinWindow()
